@@ -71,4 +71,10 @@ set -a; . ./.env; set +a
 
 ## License
 
-MIT。拿去用，改成你需要的样子。
+MIT。自由使用、修改、再分发。
+
+如果你基于 hervoice 做了二创、教程或衍生项目，请注明来源：
+
+> Based on [hervoice](https://github.com/fishisfish0614/hervoice) by [@noheyischu](https://x.com/noheyischu)
+
+这不是法律要求，是尊重。
