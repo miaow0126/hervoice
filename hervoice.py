@@ -22,8 +22,8 @@ from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import storage
@@ -304,7 +304,7 @@ async def inbox_page(q: str = "", page: int = 1, _=Depends(require_login)):
         empty = '<div class=card>还没有语音记录</div>'
         title = f"语音信箱（共 {total} 条，全部）"
         pager = _pager(page, PAGE_SIZE, total, "/inbox")
-    items = "".join(_render_message_card(m) for m in msgs) or empty
+    items = "".join(_render_message_card(m, page, q) for m in msgs) or empty
     return (INBOX_PAGE_TEMPLATE
             .replace("{{TITLE}}", title)
             .replace("{{ITEMS}}", items)
@@ -312,12 +312,22 @@ async def inbox_page(q: str = "", page: int = 1, _=Depends(require_login)):
             .replace("{{PAGER}}", pager))
 
 
-def _render_message_card(m: dict) -> str:
+def _render_message_card(m: dict, page: int = 1, q: str = "") -> str:
     status = "已读" if m["read"] else "未读"
     status_cls = "read" if m["read"] else "unread"
     replies = "".join(
         f'<div class=reply><span class=rts>{html.escape(r["ts"])}</span>{html.escape(r["text"])}</div>'
         for r in m.get("replies", []))
+    edit_form = (
+        f'<details class=edit><summary>修正文字</summary>'
+        f'<form method=post action=/api/voice/edit>'
+        f'<input type=hidden name=id value="{m["id"]}">'
+        f'<input type=hidden name=page value="{page}">'
+        f'<input type=hidden name=q value="{html.escape(q)}">'
+        f'<textarea name=text>{html.escape(m["text"])}</textarea>'
+        f'<button type=submit>保存</button>'
+        f'</form></details>'
+    )
     return (
         f'<div class=card>'
         f'<div class=meta>#{m["id"]} · {html.escape(m["emotion"])}'
@@ -325,9 +335,19 @@ def _render_message_card(m: dict) -> str:
         f' · <span class="status {status_cls}">{status}</span>'
         f' · <span class=ts>{html.escape(m["ts"])}</span></div>'
         f'<div class=body>{html.escape(m["text"])}</div>'
+        + edit_form
         + (f'<div class=replies>{replies}</div>' if replies else '')
         + '</div>'
     )
+
+
+@app.post("/api/voice/edit")
+async def edit_text(id: int = Form(...), text: str = Form(...),
+                     page: int = Form(1), q: str = Form(""),
+                     _=Depends(require_login)):
+    storage.update_text(id, text.strip())
+    qs = f"?page={page}" + (f"&q={urllib.parse.quote(q)}" if q else "")
+    return RedirectResponse(url=f"/inbox{qs}", status_code=303)
 
 
 @app.get("/log", response_class=HTMLResponse)
@@ -360,6 +380,16 @@ h1{font-size:1.1rem;font-weight:400;letter-spacing:.1em}
 .replies{margin-top:8px;padding-left:12px;border-left:2px solid var(--bg);display:flex;flex-direction:column;gap:6px}
 .reply{font-size:.82rem;opacity:.85}
 .reply .rts{opacity:.5;margin-right:8px;font-size:.72rem}
+details.edit{margin-top:8px}
+details.edit summary{font-size:.72rem;color:var(--accent);opacity:.75;cursor:pointer;letter-spacing:.05em}
+details.edit summary:hover{opacity:1}
+details.edit form{display:flex;gap:8px;margin-top:8px}
+details.edit textarea{flex:1;font-family:inherit;font-size:.86rem;padding:8px 10px;
+border-radius:8px;border:1px solid var(--bg);background:var(--bg);color:var(--fg);
+resize:vertical;min-height:2.4em}
+details.edit textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+details.edit button{font-family:inherit;font-size:.78rem;padding:6px 14px;border-radius:8px;
+border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;align-self:flex-start}
 """ + NAV_STYLE + PAGER_STYLE
 
 SEARCH_STYLE = """

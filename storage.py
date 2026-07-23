@@ -148,6 +148,13 @@ def get_by_id(msg_id: int) -> dict | None:
     return m
 
 
+def update_text(msg_id: int, text: str) -> bool:
+    """只改转写文字，不碰情感/语气分析结果——那是录音当下的真实记录，事后不能改。"""
+    with _connect() as con:
+        cur = con.execute("UPDATE messages SET text=? WHERE id=?", (text, msg_id))
+        return cur.rowcount > 0
+
+
 def mark_read(msg_id: int) -> bool:
     with _connect() as con:
         cur = con.execute("UPDATE messages SET read=1 WHERE id=?", (msg_id,))
