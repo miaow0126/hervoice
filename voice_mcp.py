@@ -14,10 +14,13 @@ import os
 import secrets
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.responses import PlainTextResponse
 
 import storage
+
+load_dotenv()
 
 DATA_DIR = Path(os.environ.get("HERVOICE_DATA", "./data"))
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")

@@ -4,3 +4,4 @@ numpy
 librosa
 python-multipart
 fastmcp
+python-dotenv

@@ -21,11 +21,14 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 import storage
+
+load_dotenv()
 
 # ── 配置（全部走环境变量，不硬编码任何密钥）──
 DATA_DIR = Path(os.environ.get("HERVOICE_DATA", "./data"))
