@@ -41,6 +41,8 @@ LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "zh")
+# 低于这个平均能量就算"没怎么说话"，跳过转写，避免 Whisper 在安静片段上瞎编字幕
+SILENCE_ENERGY_THRESHOLD = float(os.environ.get("SILENCE_ENERGY_THRESHOLD", "0.006"))
 
 WEB_USERNAME = os.environ.get("WEB_USERNAME", "")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
@@ -176,6 +178,11 @@ async def upload(file: UploadFile = File(...), _=Depends(require_login)):
                        capture_output=True, timeout=60)
         if not wav.exists():
             return JSONResponse({"error": "audio convert failed"}, status_code=400)
+        feats = _acoustic_features(wav)
+        # 基本没声音的片段丢给 Whisper 容易"幻觉"出一段听起来很像真话的文字
+        # （常见的是"请点赞订阅转发"这种视频结尾套话）——安静就直接跳过转写
+        if feats.get("energy_mean", 1) < SILENCE_ENERGY_THRESHOLD:
+            return JSONResponse({"error": "没有检测到说话内容，太安静了"}, status_code=400)
         # 转写用响度标准化过的独立副本——声音偏小也能转得准；声学特征（feats）
         # 继续用没改过响度的原始 wav，不然 energy_mean 这类信号会被标准化抹平
         wav_norm = Path(td) / "a_norm.wav"
@@ -185,7 +192,6 @@ async def upload(file: UploadFile = File(...), _=Depends(require_login)):
         text, err = _whisper(whisper_input)
         if text is None:
             return JSONResponse({"error": f"whisper failed: {err}"}, status_code=502)
-        feats = _acoustic_features(wav)
         if KEEP_AUDIO:
             try:
                 CLIPS.mkdir(parents=True, exist_ok=True)
@@ -278,7 +284,7 @@ async function send(){
  try{const r=await fetch('/api/voice/upload',{method:'POST',body:fd});
  if(r.status===401){tip.textContent='登录过期，刷新页面重新登录';return;}
  const d=await r.json();
- if(d.error){tip.textContent='出错了: '+d.error;return;}
+ if(d.error){tip.textContent=d.error.includes('太安静')?d.error:'出错了: '+d.error;return;}
  const c=document.createElement('div');c.className='card';
  const meta=document.createElement('div');meta.className='emo';
  meta.textContent='#'+d.id+' · '+d.emotion+' · '+(d.hint||'');
@@ -336,6 +342,15 @@ def _render_message_card(m: dict, page: int = 1, q: str = "") -> str:
         f'<button type=submit>保存</button>'
         f'</form></details>'
     )
+    delete_form = (
+        f'<form method=post action=/api/voice/delete class=delete-form '
+        f'onsubmit="return confirm(\'确认删除 #{m["id"]} 语音？删掉就找不回来了\')">'
+        f'<input type=hidden name=id value="{m["id"]}">'
+        f'<input type=hidden name=page value="{page}">'
+        f'<input type=hidden name=q value="{html.escape(q)}">'
+        f'<button type=submit>删除</button>'
+        f'</form>'
+    )
     return (
         f'<div class=card>'
         f'<div class=meta>#{m["id"]} · {html.escape(m["emotion"])}'
@@ -343,7 +358,7 @@ def _render_message_card(m: dict, page: int = 1, q: str = "") -> str:
         f' · <span class="status {status_cls}">{status}</span>'
         f' · <span class=ts>{html.escape(m["ts"])}</span></div>'
         f'<div class=body>{html.escape(m["text"])}</div>'
-        + edit_form
+        f'<div class=actions>{edit_form}{delete_form}</div>'
         + (f'<div class=replies>{replies}</div>' if replies else '')
         + '</div>'
     )
@@ -354,6 +369,14 @@ async def edit_text(id: int = Form(...), text: str = Form(...),
                      page: int = Form(1), q: str = Form(""),
                      _=Depends(require_login)):
     storage.update_text(id, text.strip())
+    qs = f"?page={page}" + (f"&q={urllib.parse.quote(q)}" if q else "")
+    return RedirectResponse(url=f"/inbox{qs}", status_code=303)
+
+
+@app.post("/api/voice/delete")
+async def delete_message(id: int = Form(...), page: int = Form(1), q: str = Form(""),
+                          _=Depends(require_login)):
+    storage.delete_message(id)
     qs = f"?page={page}" + (f"&q={urllib.parse.quote(q)}" if q else "")
     return RedirectResponse(url=f"/inbox{qs}", status_code=303)
 
@@ -388,7 +411,8 @@ h1{font-size:1.1rem;font-weight:400;letter-spacing:.1em}
 .replies{margin-top:8px;padding-left:12px;border-left:2px solid var(--bg);display:flex;flex-direction:column;gap:6px}
 .reply{font-size:.82rem;opacity:.85}
 .reply .rts{opacity:.5;margin-right:8px;font-size:.72rem}
-details.edit{margin-top:8px}
+.actions{display:flex;align-items:flex-start;gap:14px;margin-top:8px}
+details.edit{flex:1}
 details.edit summary{font-size:.72rem;color:var(--accent);opacity:.75;cursor:pointer;letter-spacing:.05em}
 details.edit summary:hover{opacity:1}
 details.edit form{display:flex;gap:8px;margin-top:8px}
@@ -398,6 +422,9 @@ resize:vertical;min-height:2.4em}
 details.edit textarea:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 details.edit button{font-family:inherit;font-size:.78rem;padding:6px 14px;border-radius:8px;
 border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;align-self:flex-start}
+form.delete-form button{font-family:inherit;font-size:.72rem;letter-spacing:.05em;
+background:none;border:none;color:var(--fg);opacity:.4;cursor:pointer;padding:0}
+form.delete-form button:hover{opacity:.9}
 """ + NAV_STYLE + PAGER_STYLE
 
 SEARCH_STYLE = """

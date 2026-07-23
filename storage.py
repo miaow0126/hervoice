@@ -126,6 +126,14 @@ def get_unread(mark_read: bool = True) -> list[dict]:
     return out
 
 
+def delete_message(msg_id: int) -> bool:
+    """删掉一条语音消息，连带它下面的回复一起删（没有外键级联，手动清）。"""
+    with _connect() as con:
+        con.execute("DELETE FROM replies WHERE message_id=?", (msg_id,))
+        cur = con.execute("DELETE FROM messages WHERE id=?", (msg_id,))
+        return cur.rowcount > 0
+
+
 def get_by_date(date_str: str) -> list[dict]:
     """date_str: 'YYYY-MM-DD'"""
     with _connect() as con:
