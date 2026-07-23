@@ -176,7 +176,13 @@ async def upload(file: UploadFile = File(...), _=Depends(require_login)):
                        capture_output=True, timeout=60)
         if not wav.exists():
             return JSONResponse({"error": "audio convert failed"}, status_code=400)
-        text, err = _whisper(wav)
+        # 转写用响度标准化过的独立副本——声音偏小也能转得准；声学特征（feats）
+        # 继续用没改过响度的原始 wav，不然 energy_mean 这类信号会被标准化抹平
+        wav_norm = Path(td) / "a_norm.wav"
+        subprocess.run(["ffmpeg", "-y", "-i", str(wav), "-af", "loudnorm", str(wav_norm)],
+                       capture_output=True, timeout=60)
+        whisper_input = wav_norm if wav_norm.exists() else wav
+        text, err = _whisper(whisper_input)
         if text is None:
             return JSONResponse({"error": f"whisper failed: {err}"}, status_code=502)
         feats = _acoustic_features(wav)
@@ -193,7 +199,8 @@ async def upload(file: UploadFile = File(...), _=Depends(require_login)):
                 clip_name = ""
     try:
         emo = _judge_emotion(text, feats)
-    except Exception:
+    except Exception as e:
+        print(f"[hervoice] emotion analysis failed: {e!r}")
         emo = {"emotion": "neutral", "confidence": 0.0, "hint": "emotion analysis failed"}
     msg_id = storage.add_message(
         text=text, emotion=emo.get("emotion", "neutral"),
@@ -224,9 +231,9 @@ PAGE = """<!doctype html><html lang=zh><head><meta charset=utf-8>
 :root{--bg:#faf7f2;--fg:#3a3532;--accent:#c96f5e;--soft:#e8ded2}
 @media(prefers-color-scheme:dark){:root{--bg:#1c1a18;--fg:#e8e2da;--accent:#d98873;--soft:#3a342e}}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--fg);
-font-family:Georgia,'Songti SC',serif;min-height:100vh;display:flex;flex-direction:column;
-align-items:center;justify-content:center;gap:28px;padding:24px}
-h1{font-size:1.3rem;font-weight:400;letter-spacing:.15em}
+font-family:Georgia,'Songti SC',serif;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;
+align-items:center;justify-content:flex-start;gap:28px;padding:24px}
+h1{font-size:1.3rem;font-weight:400;letter-spacing:.15em;margin-top:12vh}
 #btn{width:120px;height:120px;border-radius:50%;border:2px solid var(--accent);
 background:transparent;color:var(--accent);font-size:1rem;font-family:inherit;
 transition:all .2s;touch-action:none;-webkit-user-select:none;user-select:none;cursor:pointer}
