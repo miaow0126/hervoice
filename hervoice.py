@@ -227,18 +227,26 @@ async def audio_clip(name: str, _=Depends(require_login)):
 
 PAGE = """<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no">
+<link rel=preconnect href=https://fonts.gstatic.com crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Love+Light&display=swap" rel=stylesheet>
 <title>her voice</title><style>
 :root{--bg:#faf7f2;--fg:#3a3532;--accent:#c96f5e;--soft:#e8ded2}
 @media(prefers-color-scheme:dark){:root{--bg:#1c1a18;--fg:#e8e2da;--accent:#d98873;--soft:#3a342e}}
 *{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--fg);
 font-family:Georgia,'Songti SC',serif;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;
 align-items:center;justify-content:flex-start;gap:28px;padding:24px}
-h1{font-size:1.3rem;font-weight:400;letter-spacing:.15em;margin-top:12vh}
+h1{font-family:'Love Light',cursive;font-size:2.6rem;font-weight:400;letter-spacing:.03em;margin-top:12vh}
 #btn{width:120px;height:120px;border-radius:50%;border:2px solid var(--accent);
-background:transparent;color:var(--accent);font-size:1rem;font-family:inherit;
-transition:all .2s;touch-action:none;-webkit-user-select:none;user-select:none;cursor:pointer}
-#btn.rec{background:var(--accent);color:var(--bg);transform:scale(1.08);
-box-shadow:0 0 0 12px color-mix(in srgb,var(--accent) 18%,transparent)}
+background:var(--accent);color:var(--bg);font-size:1rem;font-family:inherit;
+touch-action:none;-webkit-user-select:none;user-select:none;cursor:pointer}
+#btn.rec{animation:pulse-ring 1.6s ease-in-out infinite}
+@keyframes pulse-ring{
+ 0%,100%{box-shadow:0 0 0 6px color-mix(in srgb,var(--accent) 22%,transparent)}
+ 50%{box-shadow:0 0 0 20px color-mix(in srgb,var(--accent) 8%,transparent)}
+}
+@media(prefers-reduced-motion:reduce){
+ #btn.rec{animation:none;box-shadow:0 0 0 14px color-mix(in srgb,var(--accent) 14%,transparent)}
+}
 #out{max-width:420px;width:100%;display:flex;flex-direction:column;gap:10px}
 .card{background:var(--soft);border-radius:14px;padding:14px 16px;font-size:.92rem;line-height:1.55}
 .emo{color:var(--accent);font-size:.8rem;letter-spacing:.08em}
@@ -246,7 +254,7 @@ box-shadow:0 0 0 12px color-mix(in srgb,var(--accent) 18%,transparent)}
 """ + NAV_STYLE + """
 </style></head><body>
 """ + _nav("/") + """
-<h1>her voice 🎙</h1>
+<h1>Her Voice 🎙</h1>
 <button id=btn>点击开始</button>
 <div id=tip>点一下开始说话，再点一下结束</div>
 <div id=out></div>

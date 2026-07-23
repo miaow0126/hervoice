@@ -13,6 +13,7 @@ Bearer token 鉴权，跟 hervoice.py 共用同一个 SQLite 数据库（storage
 import os
 import secrets
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -99,12 +100,18 @@ def get_recent_activity(n: int = 20) -> list[dict]:
 
 
 def _require_token(app):
-    """极简 ASGI 中间件：streamable-http 请求必须带对的 Bearer token"""
+    """极简 ASGI 中间件：streamable-http 请求必须带对的 token。
+    支持两种带法：Authorization: Bearer <token> 请求头，或者 URL 里的
+    ?token=<token> 参数——某些 MCP 客户端（比如 Claude 桌面端的"添加连接器"）
+    界面上没有能填自定义请求头的地方，只能把 token 拼进 URL。"""
     async def middleware(scope, receive, send):
         if scope["type"] == "http":
             headers = dict(scope.get("headers") or [])
             auth = headers.get(b"authorization", b"").decode()
             token = auth[7:] if auth.startswith("Bearer ") else ""
+            if not token:
+                qs = parse_qs((scope.get("query_string") or b"").decode())
+                token = qs.get("token", [""])[0]
             if not secrets.compare_digest(token, MCP_TOKEN):
                 resp = PlainTextResponse("unauthorized", status_code=401)
                 await resp(scope, receive, send)
