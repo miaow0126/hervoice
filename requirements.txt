@@ -3,3 +3,4 @@ uvicorn
 numpy
 librosa
 python-multipart
+fastmcp

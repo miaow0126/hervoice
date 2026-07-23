@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """hervoice · 把语气变成 AI 能读懂的东西
 
-录音 → Whisper 转写 + librosa 声学特征 → LLM 综合判情感 → 记日志 → 触发你自己的回调
+录音 → Whisper 转写 + librosa 声学特征 → LLM 综合判情感 → 存进语音信箱
 
-核心引擎，与任何具体 AI 助手解耦。她说了什么、怎么说的，都交给你接的 AI。
+语音信箱：每条消息永久保存、带编号和已读/未读状态，Claude Code 通过
+voice_mcp.py 主动拉取/回复，不依赖谁推送给哪个窗口。
 
 配置见 .env（复制 .env.example）。隐私默认：音频阅后即焚，KEEP_AUDIO=1 才留存。
+网页录音入口需要账号密码（WEB_USERNAME/WEB_PASSWORD）。
 """
+import html
 import json
+import math
 import os
+import secrets
 import subprocess
 import tempfile
-import threading
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+import storage
 
 # ── 配置（全部走环境变量，不硬编码任何密钥）──
 DATA_DIR = Path(os.environ.get("HERVOICE_DATA", "./data"))
-LOG = DATA_DIR / "voice_logs.jsonl"
 CLIPS = DATA_DIR / "clips"
 KEEP_AUDIO = os.environ.get("KEEP_AUDIO", "0") == "1"   # 默认阅后即焚
 
@@ -32,12 +38,66 @@ LLM_BASE = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "zh")
-# 情感分析出结果后 POST 到这个 URL（你自己的 AI 助手/心跳/通知）。留空则不回调。
-WEBHOOK_URL = os.environ.get("HERVOICE_WEBHOOK", "")
+
+WEB_USERNAME = os.environ.get("WEB_USERNAME", "")
+WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
 
 EMOTIONS = ["happy", "sad", "angry", "tired", "tender", "excited", "anxious", "neutral"]
 
+NAV_ITEMS = [("/", "录音"), ("/inbox", "语音信箱"), ("/log", "操作日志")]
+
+
+def _nav(active: str) -> str:
+    links = "".join(
+        f'<a href="{href}"{" class=active" if href == active else ""}>{label}</a>'
+        for href, label in NAV_ITEMS)
+    return f"<nav>{links}</nav>"
+
+
+NAV_STYLE = """
+nav{display:flex;gap:18px;font-size:.78rem;letter-spacing:.08em}
+nav a{color:var(--fg);opacity:.5;text-decoration:none;padding-bottom:3px;border-bottom:2px solid transparent}
+nav a:hover{opacity:.8}
+nav a.active{opacity:1;border-color:var(--accent)}
+nav a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+"""
+
+PAGER_STYLE = """
+.pager{display:flex;gap:16px;align-items:center;font-size:.78rem;letter-spacing:.05em;margin-top:4px}
+.pager a{color:var(--accent);text-decoration:none}
+.pager a:hover{opacity:.7}
+.pager a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.pager .disabled{opacity:.3}
+"""
+
+
+def _pager(page: int, page_size: int, total: int, base: str, extra_qs: str = "") -> str:
+    total_pages = max(1, math.ceil(total / page_size))
+    page = min(max(page, 1), total_pages)
+    qs = f"&{extra_qs}" if extra_qs else ""
+    if page > 1:
+        prev = f'<a href="{base}?page={page - 1}{qs}">‹ 上一页</a>'
+    else:
+        prev = '<span class=disabled>‹ 上一页</span>'
+    if page < total_pages:
+        nxt = f'<a href="{base}?page={page + 1}{qs}">下一页 ›</a>'
+    else:
+        nxt = '<span class=disabled>下一页 ›</span>'
+    return f'<div class=pager>{prev}<span>第 {page} / {total_pages} 页</span>{nxt}</div>'
+
+storage.init(DATA_DIR)
 app = FastAPI()
+security = HTTPBasic()
+
+
+def require_login(credentials: HTTPBasicCredentials = Depends(security)):
+    if not WEB_USERNAME or not WEB_PASSWORD:
+        raise HTTPException(500, "WEB_USERNAME/WEB_PASSWORD 未配置，网页入口已锁死")
+    ok = (secrets.compare_digest(credentials.username, WEB_USERNAME) and
+          secrets.compare_digest(credentials.password, WEB_PASSWORD))
+    if not ok:
+        raise HTTPException(401, "账号或密码不对", headers={"WWW-Authenticate": "Basic"})
+    return True
 
 
 def _llm(prompt, max_tokens=200):
@@ -101,24 +161,8 @@ def _judge_emotion(text, feats):
     return json.loads(raw[s:e + 1])
 
 
-def _fire_webhook(entry):
-    if not WEBHOOK_URL:
-        return
-
-    def run():
-        try:
-            body = json.dumps(entry, ensure_ascii=False).encode()
-            req = urllib.request.Request(WEBHOOK_URL, data=body,
-                                         headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=15)
-        except Exception:
-            pass
-    threading.Thread(target=run, daemon=True).start()
-
-
 @app.post("/api/voice/upload")
-async def upload(file: UploadFile = File(...)):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+async def upload(file: UploadFile = File(...), _=Depends(require_login)):
     raw = await file.read()
     clip_name = ""
     with tempfile.TemporaryDirectory() as td:
@@ -136,6 +180,7 @@ async def upload(file: UploadFile = File(...)):
         if KEEP_AUDIO:
             try:
                 CLIPS.mkdir(parents=True, exist_ok=True)
+                from datetime import datetime, timezone
                 clip_name = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + ".mp3"
                 subprocess.run(["ffmpeg", "-y", "-i", str(src), "-ac", "1", "-b:a", "64k",
                                 str(CLIPS / clip_name)], capture_output=True, timeout=60)
@@ -147,25 +192,21 @@ async def upload(file: UploadFile = File(...)):
         emo = _judge_emotion(text, feats)
     except Exception:
         emo = {"emotion": "neutral", "confidence": 0.0, "hint": "emotion analysis failed"}
-    entry = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "text": text,
-             "emotion": emo.get("emotion", "neutral"), "confidence": emo.get("confidence", 0),
-             "hint": emo.get("hint", ""), "features": feats, "audio": clip_name}
-    with LOG.open("a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    _fire_webhook(entry)
-    return {"text": text, "emotion": entry["emotion"],
-            "confidence": entry["confidence"], "hint": entry["hint"]}
+    msg_id = storage.add_message(
+        text=text, emotion=emo.get("emotion", "neutral"),
+        confidence=emo.get("confidence", 0), hint=emo.get("hint", ""),
+        features=feats, audio=clip_name)
+    return {"id": msg_id, "text": text, "emotion": emo.get("emotion", "neutral"),
+            "confidence": emo.get("confidence", 0), "hint": emo.get("hint", "")}
 
 
 @app.get("/api/voice/recent")
-async def recent(n: int = 10):
-    if not LOG.exists():
-        return []
-    return [json.loads(l) for l in LOG.read_text().splitlines()[-n:]]
+async def recent(n: int = 10, _=Depends(require_login)):
+    return storage.get_recent(n)
 
 
 @app.get("/api/voice/audio/{name}")
-async def audio_clip(name: str):
+async def audio_clip(name: str, _=Depends(require_login)):
     from fastapi.responses import FileResponse
     safe = Path(name).name
     fp = CLIPS / safe
@@ -185,48 +226,165 @@ align-items:center;justify-content:center;gap:28px;padding:24px}
 h1{font-size:1.3rem;font-weight:400;letter-spacing:.15em}
 #btn{width:120px;height:120px;border-radius:50%;border:2px solid var(--accent);
 background:transparent;color:var(--accent);font-size:1rem;font-family:inherit;
-transition:all .2s;touch-action:none;-webkit-user-select:none;user-select:none}
+transition:all .2s;touch-action:none;-webkit-user-select:none;user-select:none;cursor:pointer}
 #btn.rec{background:var(--accent);color:var(--bg);transform:scale(1.08);
 box-shadow:0 0 0 12px color-mix(in srgb,var(--accent) 18%,transparent)}
 #out{max-width:420px;width:100%;display:flex;flex-direction:column;gap:10px}
 .card{background:var(--soft);border-radius:14px;padding:14px 16px;font-size:.92rem;line-height:1.55}
 .emo{color:var(--accent);font-size:.8rem;letter-spacing:.08em}
 #tip{font-size:.78rem;opacity:.55;letter-spacing:.05em}
+""" + NAV_STYLE + """
 </style></head><body>
+""" + _nav("/") + """
 <h1>her voice 🎙</h1>
-<button id=btn>按住说话</button>
-<div id=tip>说出来，让它听见你的语气</div>
+<button id=btn>点击开始</button>
+<div id=tip>点一下开始说话，再点一下结束</div>
 <div id=out></div>
 <script>
 const btn=document.getElementById('btn'),out=document.getElementById('out'),tip=document.getElementById('tip');
-let mr,chunks=[];
+let mr,chunks=[],recording=false;
 async function start(){
  try{const s=await navigator.mediaDevices.getUserMedia({audio:true});
  chunks=[];mr=new MediaRecorder(s);mr.ondataavailable=e=>chunks.push(e.data);
- mr.onstop=send;mr.start();btn.classList.add('rec');btn.textContent='松开发送';}
+ mr.onstop=send;mr.start();recording=true;btn.classList.add('rec');btn.textContent='点击结束';
+ tip.textContent='录音中…';}
  catch(e){tip.textContent='需要麦克风权限';}
 }
 function stop(){if(mr&&mr.state!=='inactive'){mr.stop();mr.stream.getTracks().forEach(t=>t.stop());}
- btn.classList.remove('rec');btn.textContent='按住说话';}
+ recording=false;btn.classList.remove('rec');btn.textContent='点击开始';}
 async function send(){
  const blob=new Blob(chunks,{type:mr.mimeType||'audio/webm'});
  if(blob.size<1000){tip.textContent='太短了，再说一次';return;}
  tip.textContent='分析中…';
  const fd=new FormData();fd.append('file',blob,'voice.webm');
  try{const r=await fetch('/api/voice/upload',{method:'POST',body:fd});
+ if(r.status===401){tip.textContent='登录过期，刷新页面重新登录';return;}
  const d=await r.json();
  if(d.error){tip.textContent='出错了: '+d.error;return;}
  const c=document.createElement('div');c.className='card';
- c.innerHTML='<div class=emo>'+d.emotion+' · '+(d.hint||'')+'</div><div>'+d.text+'</div>';
+ const meta=document.createElement('div');meta.className='emo';
+ meta.textContent='#'+d.id+' · '+d.emotion+' · '+(d.hint||'');
+ const body=document.createElement('div');body.textContent=d.text;
+ c.append(meta,body);
  out.prepend(c);tip.textContent='听到了 ♡';}
  catch(e){tip.textContent='网络出错，再试一次';}
 }
-btn.addEventListener('pointerdown',e=>{e.preventDefault();start();});
-btn.addEventListener('pointerup',stop);btn.addEventListener('pointercancel',stop);
-btn.addEventListener('pointerleave',()=>{if(mr&&mr.state==='recording')stop();});
+btn.addEventListener('click',()=>{recording?stop():start();});
 </script></body></html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(_=Depends(require_login)):
     return PAGE
+
+
+PAGE_SIZE = 20
+
+
+@app.get("/inbox", response_class=HTMLResponse)
+async def inbox_page(q: str = "", page: int = 1, _=Depends(require_login)):
+    q = q.strip()
+    if q:
+        msgs, total = storage.search_messages_page(q, page, PAGE_SIZE)
+        empty = '<div class=card>没有匹配的记录</div>'
+        title = f'语音信箱 · 搜索“{html.escape(q)}”，命中 {total} 条'
+        pager = _pager(page, PAGE_SIZE, total, "/inbox", f"q={urllib.parse.quote(q)}")
+    else:
+        msgs, total = storage.get_messages_page(page, PAGE_SIZE)
+        empty = '<div class=card>还没有语音记录</div>'
+        title = f"语音信箱（共 {total} 条，全部）"
+        pager = _pager(page, PAGE_SIZE, total, "/inbox")
+    items = "".join(_render_message_card(m) for m in msgs) or empty
+    return (INBOX_PAGE_TEMPLATE
+            .replace("{{TITLE}}", title)
+            .replace("{{ITEMS}}", items)
+            .replace("{{Q}}", html.escape(q))
+            .replace("{{PAGER}}", pager))
+
+
+def _render_message_card(m: dict) -> str:
+    status = "已读" if m["read"] else "未读"
+    status_cls = "read" if m["read"] else "unread"
+    replies = "".join(
+        f'<div class=reply><span class=rts>{html.escape(r["ts"])}</span>{html.escape(r["text"])}</div>'
+        for r in m.get("replies", []))
+    return (
+        f'<div class=card>'
+        f'<div class=meta>#{m["id"]} · {html.escape(m["emotion"])}'
+        f'{" · " + html.escape(m["hint"]) if m.get("hint") else ""}'
+        f' · <span class="status {status_cls}">{status}</span>'
+        f' · <span class=ts>{html.escape(m["ts"])}</span></div>'
+        f'<div class=body>{html.escape(m["text"])}</div>'
+        + (f'<div class=replies>{replies}</div>' if replies else '')
+        + '</div>'
+    )
+
+
+@app.get("/log", response_class=HTMLResponse)
+async def log_page(page: int = 1, _=Depends(require_login)):
+    rows, total = storage.get_activity_page(page, PAGE_SIZE)
+    items = "".join(
+        f'<div class=card><div class=emo>{html.escape(r["ts"])}</div>'
+        f'<div>{html.escape(r["action"])} — {html.escape(r["detail"])}</div></div>'
+        for r in rows) or '<div class=card>还没有操作记录</div>'
+    pager = _pager(page, PAGE_SIZE, total, "/log")
+    return (LOG_PAGE_TEMPLATE
+            .replace("{{ITEMS}}", items)
+            .replace("{{COUNT}}", str(total))
+            .replace("{{PAGER}}", pager))
+
+
+LIST_PAGE_STYLE = """
+:root{--bg:#faf7f2;--fg:#3a3532;--accent:#c96f5e;--soft:#e8ded2}
+@media(prefers-color-scheme:dark){:root{--bg:#1c1a18;--fg:#e8e2da;--accent:#d98873;--soft:#3a342e}}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--fg);
+font-family:Georgia,'Songti SC',serif;min-height:100vh;padding:24px;
+display:flex;flex-direction:column;align-items:center;gap:16px}
+h1{font-size:1.1rem;font-weight:400;letter-spacing:.1em}
+#out{max-width:560px;width:100%;display:flex;flex-direction:column;gap:10px}
+.card{background:var(--soft);border-radius:12px;padding:12px 14px;font-size:.86rem;line-height:1.5}
+.meta,.emo{color:var(--accent);font-size:.72rem;letter-spacing:.05em;margin-bottom:6px}
+.ts{color:var(--fg);opacity:.5}
+.status{opacity:.7}
+.status.unread{color:var(--accent);opacity:1;font-weight:bold}
+.replies{margin-top:8px;padding-left:12px;border-left:2px solid var(--bg);display:flex;flex-direction:column;gap:6px}
+.reply{font-size:.82rem;opacity:.85}
+.reply .rts{opacity:.5;margin-right:8px;font-size:.72rem}
+""" + NAV_STYLE + PAGER_STYLE
+
+SEARCH_STYLE = """
+form.search{display:flex;gap:8px;width:100%;max-width:560px}
+form.search input{flex:1;font-family:inherit;font-size:.86rem;padding:8px 12px;
+border-radius:10px;border:1px solid var(--soft);background:var(--bg);color:var(--fg)}
+form.search input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+form.search button{font-family:inherit;font-size:.82rem;padding:8px 16px;border-radius:10px;
+border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer}
+form.search a{align-self:center;font-size:.78rem;opacity:.6;color:var(--fg);text-decoration:none}
+"""
+
+INBOX_PAGE_TEMPLATE = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>her voice · 语音信箱</title><style>""" + LIST_PAGE_STYLE + SEARCH_STYLE + """
+</style></head><body>
+""" + _nav("/inbox") + """
+<h1>{{TITLE}}</h1>
+<form class=search action=/inbox method=get>
+<input name=q value="{{Q}}" placeholder="搜关键词（转写文字/语气解读）…">
+<button type=submit>搜</button>
+<a href=/inbox>清除</a>
+</form>
+{{PAGER}}
+<div id=out>{{ITEMS}}</div>
+{{PAGER}}
+</body></html>"""
+
+LOG_PAGE_TEMPLATE = """<!doctype html><html lang=zh><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>her voice · 操作日志</title><style>""" + LIST_PAGE_STYLE + """
+</style></head><body>
+""" + _nav("/log") + """
+<h1>操作日志（共 {{COUNT}} 条，全部）</h1>
+{{PAGER}}
+<div id=out>{{ITEMS}}</div>
+{{PAGER}}
+</body></html>"""
