@@ -5,3 +5,4 @@ librosa
 python-multipart
 fastmcp
 python-dotenv
+tzdata

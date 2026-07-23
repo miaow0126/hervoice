@@ -18,7 +18,9 @@ import subprocess
 import tempfile
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from dotenv import load_dotenv
@@ -46,6 +48,22 @@ SILENCE_ENERGY_THRESHOLD = float(os.environ.get("SILENCE_ENERGY_THRESHOLD", "0.0
 
 WEB_USERNAME = os.environ.get("WEB_USERNAME", "")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+
+# 存储永远是 UTC（不怕夏令时），网页显示的时候转成这个时区
+DISPLAY_TZ = ZoneInfo(os.environ.get("DISPLAY_TZ", "Asia/Shanghai"))
+
+
+def _fmt_ts(ts: str) -> str:
+    try:
+        return datetime.fromisoformat(ts).astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ts
+
+
+def _tz_label() -> str:
+    hours = int(datetime.now(DISPLAY_TZ).utcoffset().total_seconds() // 3600)
+    sign = "+" if hours >= 0 else "-"
+    return f"UTC{sign}{abs(hours)}"
 
 EMOTIONS = ["happy", "sad", "angry", "tired", "tender", "excited", "anxious", "neutral"]
 
@@ -323,14 +341,15 @@ async def inbox_page(q: str = "", page: int = 1, _=Depends(require_login)):
             .replace("{{TITLE}}", title)
             .replace("{{ITEMS}}", items)
             .replace("{{Q}}", html.escape(q))
-            .replace("{{PAGER}}", pager))
+            .replace("{{PAGER}}", pager)
+            .replace("{{TZ}}", _tz_label()))
 
 
 def _render_message_card(m: dict, page: int = 1, q: str = "") -> str:
     status = "已读" if m["read"] else "未读"
     status_cls = "read" if m["read"] else "unread"
     replies = "".join(
-        f'<div class=reply><span class=rts>{html.escape(r["ts"])}</span>{html.escape(r["text"])}</div>'
+        f'<div class=reply><span class=rts>{html.escape(_fmt_ts(r["ts"]))}</span>{html.escape(r["text"])}</div>'
         for r in m.get("replies", []))
     edit_form = (
         f'<details class=edit><summary>修正文字</summary>'
@@ -356,7 +375,7 @@ def _render_message_card(m: dict, page: int = 1, q: str = "") -> str:
         f'<div class=meta>#{m["id"]} · {html.escape(m["emotion"])}'
         f'{" · " + html.escape(m["hint"]) if m.get("hint") else ""}'
         f' · <span class="status {status_cls}">{status}</span>'
-        f' · <span class=ts>{html.escape(m["ts"])}</span></div>'
+        f' · <span class=ts>{html.escape(_fmt_ts(m["ts"]))}</span></div>'
         f'<div class=body>{html.escape(m["text"])}</div>'
         f'<div class=actions>{edit_form}{delete_form}</div>'
         + (f'<div class=replies>{replies}</div>' if replies else '')
@@ -385,14 +404,15 @@ async def delete_message(id: int = Form(...), page: int = Form(1), q: str = Form
 async def log_page(page: int = 1, _=Depends(require_login)):
     rows, total = storage.get_activity_page(page, PAGE_SIZE)
     items = "".join(
-        f'<div class=card><div class=emo>{html.escape(r["ts"])}</div>'
+        f'<div class=card><div class=emo>{html.escape(_fmt_ts(r["ts"]))}</div>'
         f'<div>{html.escape(r["action"])} — {html.escape(r["detail"])}</div></div>'
         for r in rows) or '<div class=card>还没有操作记录</div>'
     pager = _pager(page, PAGE_SIZE, total, "/log")
     return (LOG_PAGE_TEMPLATE
             .replace("{{ITEMS}}", items)
             .replace("{{COUNT}}", str(total))
-            .replace("{{PAGER}}", pager))
+            .replace("{{PAGER}}", pager)
+            .replace("{{TZ}}", _tz_label()))
 
 
 LIST_PAGE_STYLE = """
@@ -425,6 +445,7 @@ border:1px solid var(--accent);background:transparent;color:var(--accent);cursor
 form.delete-form button{font-family:inherit;font-size:.72rem;letter-spacing:.05em;
 background:none;border:none;color:var(--fg);opacity:.4;cursor:pointer;padding:0}
 form.delete-form button:hover{opacity:.9}
+.tz-tag{position:fixed;top:14px;right:16px;font-size:.68rem;opacity:.35;letter-spacing:.05em}
 """ + NAV_STYLE + PAGER_STYLE
 
 SEARCH_STYLE = """
@@ -441,6 +462,7 @@ INBOX_PAGE_TEMPLATE = """<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>her voice · 语音信箱</title><style>""" + LIST_PAGE_STYLE + SEARCH_STYLE + """
 </style></head><body>
+<div class=tz-tag>{{TZ}}</div>
 """ + _nav("/inbox") + """
 <h1>{{TITLE}}</h1>
 <form class=search action=/inbox method=get>
@@ -457,6 +479,7 @@ LOG_PAGE_TEMPLATE = """<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>her voice · 操作日志</title><style>""" + LIST_PAGE_STYLE + """
 </style></head><body>
+<div class=tz-tag>{{TZ}}</div>
 """ + _nav("/log") + """
 <h1>操作日志（共 {{COUNT}} 条，全部）</h1>
 {{PAGER}}
